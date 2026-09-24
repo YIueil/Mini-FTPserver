@@ -1,0 +1,37 @@
+[package]
+name = "mini-ftpd-gui"
+description = "Desktop GUI for mini-ftpd (egui + system tray)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mini-ftpd-gui"
+path = "src/main.rs"
+
+[dependencies]
+ftpd-core = { path = "../ftpd-core" }
+eframe = { version = "0.31", features = ["persistence"] }
+tray-icon = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+local-ip-address = "0.6"
+
+# tray-icon 的 Linux 后端基于 gtk，建托盘前必须 gtk::init()
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"

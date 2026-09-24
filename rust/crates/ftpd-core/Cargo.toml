@@ -1,0 +1,19 @@
+[package]
+name = "ftpd-core"
+description = "Core FTP server library (Rust rewrite of Slyar FTPserver)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "sync", "rt-multi-thread", "macros", "io-util", "fs"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,18 @@
+[package]
+name = "mini-ftpd"
+description = "A mini FTP server (Rust rewrite of Slyar FTPserver)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mini-ftpd"
+path = "src/main.rs"
+
+[dependencies]
+ftpd-core = { path = "../ftpd-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

@@ -1,0 +1,53 @@
+# mini-ftpd configuration
+# All keys are optional; shown values are the defaults.
+
+# Listen address. Use "::" for IPv6 (note: PASV is IPv4-only,
+# as in the original MFC version).
+listen = "0.0.0.0"
+
+# Control port. 21 requires admin/root privileges.
+port = 21
+
+# Maximum simultaneous control connections.
+max_connections = 100
+
+# Close control connections idle for this many seconds.
+idle_timeout_secs = 300
+
+welcome_message = "Welcome to mini-ftpd!"
+goodbye_message = "Goodbye!"
+
+# Port range for PASV data connections.
+# min = 0 lets the OS assign an ephemeral port (original behavior).
+# Set a range (e.g. 60000-60100) to make firewall rules easy.
+[passive_ports]
+min = 0
+max = 0
+
+# At least one user is required.
+# The user named "anonymous" accepts any password (original behavior).
+[[users]]
+username = "anonymous"
+password = ""
+home = "./ftp_root"
+
+[users.permissions]
+download = true
+upload = false
+rename = false
+delete = false
+mkdir = false
+# Directory listing requires download OR upload (derived, original rule).
+# Overwriting an existing file additionally requires delete = true.
+
+# Example of a second, fully privileged user:
+# [[users]]
+# username = "admin"
+# password = "change-me"
+# home = "/srv/ftp"
+# [users.permissions]
+# download = true
+# upload = true
+# rename = true
+# delete = true
+# mkdir = true
