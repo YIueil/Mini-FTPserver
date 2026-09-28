@@ -6,19 +6,24 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "mini-ftpd-gui"
+name = "MiniFTP"
 path = "src/main.rs"
 
 [dependencies]
 ftpd-core = { path = "../ftpd-core" }
+mini-ftpd = { path = "../mini-ftpd" }
 eframe = { version = "0.31", features = ["persistence"] }
 tray-icon = "0.21"
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 local-ip-address = "0.6"
+
+[build-dependencies]
+embed-resource = "3"
 
 # tray-icon 的 Linux 后端基于 gtk，建托盘前必须 gtk::init()
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -30,6 +35,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

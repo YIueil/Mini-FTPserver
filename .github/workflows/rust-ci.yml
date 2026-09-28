@@ -1,0 +1,43 @@
+name: rust-ci
+
+on:
+  push:
+    paths: ["rust/**", ".github/workflows/rust-ci.yml"]
+  pull_request:
+    paths: ["rust/**"]
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # mini-ftpd-gui 的 Linux 托盘后端（gtk/libappindicator/libxdo）
+      - name: Install GUI system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libappindicator3-dev libxdo-dev
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace

@@ -40,14 +40,14 @@ cargo build --release
 git tag rust-v1.0.0 && git push origin rust-v1.0.0
 ```
 
-产物（含 SHA256 校验和）。除 aarch64 Linux 外的包同时包含 CLI（`mini-ftpd`）与 GUI（`mini-ftpd-gui`）；aarch64 Linux 面向服务器场景，仅含 CLI：
+产物（含 SHA256 校验和）。Windows 包为单文件 `MiniFTP.exe`：无参数启动为桌面 GUI，带参数即为无界面 CLI 服务器（参数同下述 `mini-ftpd`，如 `MiniFTP.exe -c mini-ftpd.toml -p 2121`；输出附加到启动它的控制台）。Linux / macOS 包同时包含独立 CLI（`mini-ftpd`）与 GUI（`MiniFTP`，包名 mini-ftpd-gui），aarch64 Linux 面向服务器场景仅含 CLI：
 
 | 目标平台 | 产物 | 内容 |
 |---|---|---|
 | Linux x86_64 | `mini-ftpd-<ver>-<target>.tar.gz` | CLI + GUI |
 | Linux aarch64 | `mini-ftpd-<ver>-<target>.tar.gz` | 仅 CLI |
 | macOS x86_64 / Apple Silicon | `mini-ftpd-<ver>-<target>.tar.gz` | CLI + GUI |
-| Windows x86_64 | `mini-ftpd-<ver>-<target>.zip` | CLI + GUI |
+| Windows x86_64 | `MiniFTP-<ver>-<target>.zip` | 单文件 MiniFTP.exe（GUI/CLI 双模式） |
 
 本地交叉编译 aarch64 Linux：`cargo install cross && cross build --release --target aarch64-unknown-linux-gnu`
 
@@ -66,7 +66,7 @@ crates/mini-ftpd        CLI 二进制
 crates/mini-ftpd-gui    桌面 GUI（egui + 系统托盘）：配置编辑、用户权限、启停、日志面板
 ```
 
-GUI 运行：`cargo run -p mini-ftpd-gui`（关闭窗口最小化到托盘，托盘不可用时直接退出；仅允许单实例运行；启动时自动加载系统中文字体；顶栏可切换亮色/暗黑主题、显示/隐藏日志面板，选择自动保存；启动服务器时自动保存配置并在日志中列出各网卡的 ftp:// 访问地址）。GUI 与 CLI 共用同一份 TOML 配置（默认 `./mini-ftpd.toml`）。
+GUI 运行：`cargo run -p mini-ftpd-gui`（窗口标题与托盘显示为 MiniFTP；最小化按钮最小化到托盘，关闭按钮停止服务并退出；托盘不可用时最小化退到任务栏；仅允许单实例运行；启动时自动加载系统中文字体；顶栏可切换亮色/暗黑主题、显示/隐藏日志面板，选择自动保存；启动服务器时自动保存配置并在日志中列出各网卡的 ftp:// 访问地址）。GUI 与 CLI 共用同一份 TOML 配置（默认 `./mini-ftpd.toml`）。
 
 Linux 构建 GUI 需要系统依赖（托盘后端）：`sudo apt install libgtk-3-dev libappindicator3-dev libxdo-dev`（Arch：`pacman -S gtk3 libappindicator-gtk3 xdotool`；Windows / macOS 无需额外依赖）。
 

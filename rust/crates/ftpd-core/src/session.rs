@@ -1,4 +1,5 @@
 use crate::auth::UserStore;
+use crate::charset::Encoding;
 use crate::command::{self, FtpCommand};
 use crate::config::ServerConfig;
 use crate::data::DataChannel;
@@ -30,9 +31,15 @@ struct Transfer {
 }
 
 enum Payload {
-    Listing(String),
+    Listing(Vec<u8>),
     Download(PathBuf),
     Upload(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum ListStyle {
+    Detailed,
+    NamesOnly,
 }
 
 /// One control connection. Mirrors the original CControlSocket state machine.
@@ -49,6 +56,7 @@ pub struct Session {
     login_name: String,
     vfs: Option<VirtualFs>,
     cwd: String,
+    encoding: Encoding,
     data: Option<DataChannel>,
     rename_from: Option<PathBuf>,
     transfer: Option<Transfer>,
@@ -74,6 +82,7 @@ impl Session {
             login_name: String::new(),
             vfs: None,
             cwd: "/".to_string(),
+            encoding: Encoding::default(),
             data: None,
             rename_from: None,
             transfer: None,
@@ -101,7 +110,8 @@ impl Session {
                     }
                     line = read_command(reader) => {
                         match line {
-                            Ok(Some(line)) => {
+                            Ok(Some(raw)) => {
+                                let line = self.encoding.decode(&raw);
                                 let cmd = command::parse(&line);
                                 match cmd.verb.as_str() {
                                     "ABOR" => self.do_abor().await,
@@ -130,7 +140,8 @@ impl Session {
                         return Ok(());
                     }
                     Ok(Ok(None)) => return Ok(()),
-                    Ok(Ok(Some(line))) => {
+                    Ok(Ok(Some(raw))) => {
+                        let line = self.encoding.decode(&raw);
                         if !self.dispatch(&line).await {
                             return Ok(());
                         }
@@ -146,7 +157,14 @@ impl Session {
         let cmd = command::parse(line);
         debug!(peer = %self.peer, verb = %cmd.verb, "command");
 
-        if self.awaiting_login && cmd.verb != "USER" && cmd.verb != "PASS" {
+        // Negotiation commands must work pre-login: clients send
+        // FEAT/OPTS UTF8 ON right after the greeting.
+        if self.awaiting_login
+            && !matches!(
+                cmd.verb.as_str(),
+                "USER" | "PASS" | "FEAT" | "OPTS" | "SYST" | "NOOP"
+            )
+        {
             return self.reply("530 Please login with USER and PASS.").await;
         }
 
@@ -171,6 +189,7 @@ impl Session {
             "PORT" => self.do_port(&cmd.arg).await,
             "PASV" => self.do_pasv().await,
             "LIST" => self.do_list(&cmd.arg).await,
+            "NLST" => self.do_nlst(&cmd.arg).await,
             "RETR" => self.do_retr(&cmd.arg).await,
             "STOR" => self.do_stor(&cmd.arg).await,
             "SIZE" => self.do_size(&cmd.arg).await,
@@ -185,6 +204,8 @@ impl Session {
             }
             "SYST" => self.reply("215 UNIX mini-ftpd").await,
             "NOOP" => self.reply("200 OK").await,
+            "FEAT" => self.reply("211-Features:\r\n UTF8\r\n211 End").await,
+            "OPTS" => self.do_opts(&cmd.arg).await,
             _ => self.reply("502 Command not implemented.").await,
         }
     }
@@ -210,6 +231,24 @@ impl Session {
                 self.reply("530 Not logged in, user or password incorrect!")
                     .await
             }
+        }
+    }
+
+    async fn do_opts(&mut self, arg: &str) -> bool {
+        let tokens: Vec<String> = arg
+            .split_whitespace()
+            .map(|t| t.to_uppercase())
+            .collect();
+        match tokens.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+            ["UTF8", "ON"] | ["UTF-8", "ON"] | ["UTF8"] => {
+                self.encoding = Encoding::Utf8;
+                self.reply("200 UTF8 mode enabled.").await
+            }
+            ["UTF8", "OFF"] | ["UTF-8", "OFF"] => {
+                self.encoding = Encoding::Ansi;
+                self.reply("200 UTF8 mode disabled.").await
+            }
+            _ => self.reply("501 Option not supported.").await,
         }
     }
 
@@ -274,6 +313,14 @@ impl Session {
     }
 
     async fn do_list(&mut self, arg: &str) -> bool {
+        self.do_listing(arg, ListStyle::Detailed).await
+    }
+
+    async fn do_nlst(&mut self, arg: &str) -> bool {
+        self.do_listing(arg, ListStyle::NamesOnly).await
+    }
+
+    async fn do_listing(&mut self, arg: &str, style: ListStyle) -> bool {
         let Some(vfs) = &self.vfs else {
             return self.reply("530 Please login with USER and PASS.").await;
         };
@@ -303,7 +350,11 @@ impl Session {
                 .await;
         }
         let listing = if resolved.local.is_dir() {
-            match vfs.list(&resolved.local) {
+            let entries = match style {
+                ListStyle::Detailed => vfs.list(&resolved.local),
+                ListStyle::NamesOnly => vfs.list_names(&resolved.local),
+            };
+            match entries {
                 Ok(l) => l,
                 Err(_) => {
                     return self
@@ -317,16 +368,22 @@ impl Session {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            match std::fs::metadata(&resolved.local) {
-                Ok(meta) => crate::fs::format_entry(&name, &meta),
-                Err(_) => String::new(),
+            match style {
+                ListStyle::Detailed => match std::fs::metadata(&resolved.local) {
+                    Ok(meta) => crate::fs::format_entry(&name, &meta),
+                    Err(_) => String::new(),
+                },
+                ListStyle::NamesOnly => format!("{name}\r\n"),
             }
         };
 
-        if !self
-            .reply("150 Opening ASCII mode data connection for directory list.")
-            .await
-        {
+        let banner = match style {
+            ListStyle::Detailed => {
+                "150 Opening ASCII mode data connection for directory list."
+            }
+            ListStyle::NamesOnly => "150 Opening ASCII mode data connection for file list.",
+        };
+        if !self.reply(banner).await {
             return false;
         }
         match self.open_data().await {
@@ -337,6 +394,7 @@ impl Session {
                     self.data = None;
                     self.reply("226 Transfer complete.").await
                 } else {
+                    let listing = self.encoding.encode(&listing);
                     self.start_transfer(Payload::Listing(listing), stream);
                     true
                 }
@@ -633,14 +691,13 @@ impl Session {
 
     async fn reply(&mut self, msg: &str) -> bool {
         debug!(peer = %self.peer, "<-- {}", msg);
-        let mut line = String::with_capacity(msg.len() + 2);
-        line.push_str(msg);
-        line.push_str("\r\n");
-        self.writer.write_all(line.as_bytes()).await.is_ok()
+        let mut bytes = self.encoding.encode(msg);
+        bytes.extend_from_slice(b"\r\n");
+        self.writer.write_all(&bytes).await.is_ok()
     }
 }
 
-async fn read_command(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<Option<String>> {
+async fn read_command(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::with_capacity(256);
     let n = tokio::io::AsyncBufReadExt::read_until(reader, b'\n', &mut buf).await?;
     if n == 0 {
@@ -652,8 +709,10 @@ async fn read_command(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<Optio
             "command line too long",
         ));
     }
-    let line = String::from_utf8_lossy(&buf);
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    while matches!(buf.last(), Some(b'\r' | b'\n')) {
+        buf.pop();
+    }
+    Ok(Some(buf))
 }
 
 async fn run_transfer(payload: Payload, mut stream: TcpStream) -> TransferOutcome {
@@ -661,7 +720,7 @@ async fn run_transfer(payload: Payload, mut stream: TcpStream) -> TransferOutcom
     const CANT_ACCESS: &str = "450 Can't access file.";
     let mut buf = vec![0u8; TRANSFER_BUF];
     match payload {
-        Payload::Listing(text) => match stream.write_all(text.as_bytes()).await {
+        Payload::Listing(bytes) => match stream.write_all(&bytes).await {
             Ok(_) => TransferOutcome::Complete,
             Err(_) => TransferOutcome::Failed(ABORTED.into()),
         },

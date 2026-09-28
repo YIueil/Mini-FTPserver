@@ -20,20 +20,31 @@ const DEFAULT_CONFIG_PATH: &str = "./mini-ftpd.toml";
 const MAX_LOG_LINES: usize = 500;
 
 fn main() -> eframe::Result<()> {
+    // 单文件双模式：带任何参数即按无界面 CLI 服务器运行（MiniFTP.exe -c config.toml 等）
+    if std::env::args_os().len() > 1 {
+        run_cli_mode();
+    }
+
     // 托盘程序惯例：只允许一个实例，否则每次启动都会多一个托盘图标
     if !acquire_single_instance() {
         return Ok(());
     }
 
+    let (rgba, icon_w, icon_h) = load_icon_rgba();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("mini-ftpd")
+            .with_title("MiniFTP")
             .with_inner_size([860.0, 620.0])
-            .with_min_inner_size([720.0, 520.0]),
+            .with_min_inner_size([720.0, 520.0])
+            .with_icon(std::sync::Arc::new(egui::IconData {
+                rgba,
+                width: icon_w,
+                height: icon_h,
+            })),
         ..Default::default()
     };
     eframe::run_native(
-        "mini-ftpd",
+        "MiniFTP",
         options,
         Box::new(|cc| {
             let app = GuiApp::new(cc);
@@ -78,6 +89,51 @@ fn acquire_single_instance() -> bool {
         }
         // 有意泄漏 fd：进程存活期间持有文件锁
         libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0
+    }
+}
+
+fn run_cli_mode() -> ! {
+    #[cfg(windows)]
+    attach_console();
+    println!("MiniFTP：检测到命令行参数，以无界面（CLI）模式运行");
+    let code = match mini_ftpd::run() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e:?}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+// windows_subsystem = "windows" 的程序默认无控制台：附加到父控制台（从终端启动时），
+// 失败则自分配一个（从资源管理器带参启动时），并把标准句柄重定向过去，否则日志不可见
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::Console::{
+        AllocConsole, AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        let conout = CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if !conout.is_null() && conout != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_OUTPUT_HANDLE, conout);
+            SetStdHandle(STD_ERROR_HANDLE, conout);
+        }
     }
 }
 
@@ -197,23 +253,13 @@ struct TrayState {
     quit_id: MenuId,
 }
 
-fn make_icon() -> tray_icon::Icon {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            if dx * dx + dy * dy < 13.0 * 13.0 {
-                let i = ((y * w + x) * 4) as usize;
-                rgba[i] = 0x2b;
-                rgba[i + 1] = 0x6c;
-                rgba[i + 2] = 0xb5;
-                rgba[i + 3] = 0xff;
-            }
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, w, h).expect("icon size is valid")
+fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
+    let bytes = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(bytes)
+        .expect("embedded icon decodes")
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    (img.into_raw(), w, h)
 }
 
 fn setup_tray() -> Option<TrayState> {
@@ -222,10 +268,12 @@ fn setup_tray() -> Option<TrayState> {
     let show_id = show.id().clone();
     let quit_id = quit.id().clone();
     let menu = Menu::with_items(&[&show, &quit]).ok()?;
+    let (rgba, w, h) = load_icon_rgba();
+    let icon = tray_icon::Icon::from_rgba(rgba, w, h).expect("icon size is valid");
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("mini-ftpd")
-        .with_icon(make_icon())
+        .with_tooltip("MiniFTP")
+        .with_icon(icon)
         .build()
         .ok()?;
     Some(TrayState {
@@ -277,6 +325,47 @@ fn wake_main_window(hwnd: &AtomicIsize) {
     unsafe {
         ShowWindow(raw as _, SW_RESTORE);
         SetForegroundWindow(raw as _);
+    }
+}
+
+// Windows 下最小化进托盘走窗口子类拦截：egui 的最小化检测依赖帧驱动，
+// 窗口从托盘原生恢复后时序不可靠（第二次最小化时 update 不会执行），
+// 在 wndproc 里拦截 SC_MINIMIZE 直接隐藏则完全绕开该问题
+#[cfg(windows)]
+static OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+
+#[cfg(windows)]
+unsafe extern "system" fn tray_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, ShowWindow, SC_MINIMIZE, SW_HIDE, WM_SYSCOMMAND, WNDPROC,
+    };
+    if msg == WM_SYSCOMMAND && (wparam as u32 & 0xFFF0) == SC_MINIMIZE {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    let old = OLD_WNDPROC.load(Ordering::SeqCst);
+    let prev: WNDPROC = std::mem::transmute(old);
+    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+}
+
+#[cfg(windows)]
+fn install_minimize_to_tray(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+    if OLD_WNDPROC.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    unsafe {
+        let old = SetWindowLongPtrW(hwnd as _, GWLP_WNDPROC, tray_subclass_proc as *const () as isize);
+        if old == 0 {
+            tracing::warn!("最小化进托盘拦截安装失败，最小化将退到任务栏");
+            return;
+        }
+        OLD_WNDPROC.store(old, Ordering::SeqCst);
     }
 }
 
@@ -386,7 +475,7 @@ impl GuiApp {
         let gtk_ok = gtk_ready();
         let tray = if gtk_ok { setup_tray() } else { None };
         if tray.is_none() {
-            tracing::warn!("系统托盘不可用（关闭窗口将直接退出）");
+            tracing::warn!("系统托盘不可用（最小化退到任务栏，关闭直接退出）");
         }
 
         #[cfg(windows)]
@@ -664,13 +753,22 @@ impl eframe::App for GuiApp {
             if let Ok(handle) = _frame.window_handle() {
                 if let raw_window_handle::RawWindowHandle::Win32(w) = handle.as_raw() {
                     self.hwnd.store(w.hwnd.get(), Ordering::Relaxed);
+                    if self.tray.is_some() {
+                        install_minimize_to_tray(w.hwnd.get());
+                    }
                 }
             }
         }
 
-        // Close button minimizes to tray when available.
-        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        // 关闭按钮：停止服务并直接退出（不取消关闭，走 eframe 正常退出流程）
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.stop_server();
+        }
+
+        // 非 Windows 平台：检测到最小化则隐藏到托盘；无托盘时保持系统默认的最小化行为。
+        // Windows 由 install_minimize_to_tray 的窗口子类在原生层处理
+        #[cfg(not(windows))]
+        if self.tray.is_some() && ctx.input(|i| i.viewport().minimized) == Some(true) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             tracing::info!("已最小化到系统托盘（托盘菜单可恢复或退出）");
         }
@@ -682,7 +780,7 @@ impl eframe::App for GuiApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("mini-ftpd").size(17.0).strong());
+                    ui.label(egui::RichText::new("MiniFTP").size(17.0).strong());
                     ui.separator();
                     match &self.server {
                         Some(s) => {

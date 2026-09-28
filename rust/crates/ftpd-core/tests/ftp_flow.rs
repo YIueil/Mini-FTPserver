@@ -4,6 +4,7 @@
 use ftpd_core::auth::UserStore;
 use ftpd_core::config::{Permissions, ServerConfig, UserConfig};
 use ftpd_core::server::FtpServer;
+use encoding_rs::GBK;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -67,22 +68,43 @@ impl Client {
         client
     }
 
-    async fn read_reply(&mut self) -> (u16, String) {
-        let mut line = String::new();
-        self.reader.read_line(&mut line).await.unwrap();
-        let code: u16 = line
-            .get(..3)
+    async fn read_reply_bytes(&mut self) -> (u16, Vec<u8>) {
+        let mut line = Vec::new();
+        self.reader.read_until(b'\n', &mut line).await.unwrap();
+        let code: u16 = std::str::from_utf8(&line[..3])
+            .ok()
             .and_then(|c| c.parse().ok())
             .unwrap_or_else(|| panic!("bad reply line: {line:?}"));
-        (code, line.trim_end().to_string())
+        // Multiline replies start with "NNN-" and end at a bare "NNN " line.
+        if line.get(3) == Some(&b'-') {
+            let prefix = format!("{code} ").into_bytes();
+            loop {
+                let mut cont = Vec::new();
+                self.reader.read_until(b'\n', &mut cont).await.unwrap();
+                let last = cont.starts_with(&prefix);
+                line.extend_from_slice(&cont);
+                if last {
+                    break;
+                }
+            }
+        }
+        (code, line)
+    }
+
+    async fn read_reply(&mut self) -> (u16, String) {
+        let (code, bytes) = self.read_reply_bytes().await;
+        (code, String::from_utf8_lossy(&bytes).trim_end().to_string())
     }
 
     async fn cmd(&mut self, c: &str) -> (u16, String) {
-        self.writer
-            .write_all(format!("{c}\r\n").as_bytes())
-            .await
-            .unwrap();
-        self.read_reply().await
+        let (code, bytes) = self.cmd_raw(c.as_bytes()).await;
+        (code, String::from_utf8_lossy(&bytes).trim_end().to_string())
+    }
+
+    async fn cmd_raw(&mut self, bytes: &[u8]) -> (u16, Vec<u8>) {
+        self.writer.write_all(bytes).await.unwrap();
+        self.writer.write_all(b"\r\n").await.unwrap();
+        self.read_reply_bytes().await
     }
 
     async fn login(&mut self) {
@@ -173,6 +195,20 @@ async fn full_flow_pasv() {
     assert_eq!(c.read_reply().await.0, 226);
     assert!(listing.contains("file.txt"), "{listing}");
 
+    // NLST returns bare names only
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd("NLST").await.0, 150);
+    let names = String::from_utf8(read_all(&mut data).await).unwrap();
+    assert_eq!(c.read_reply().await.0, 226);
+    assert_eq!(names, "file.txt\r\n");
+
+    // NLST of a single file echoes its name
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd("NLST file.txt").await.0, 150);
+    let names = String::from_utf8(read_all(&mut data).await).unwrap();
+    assert_eq!(c.read_reply().await.0, 226);
+    assert_eq!(names, "file.txt\r\n");
+
     // RETR round-trips the content
     let mut data = c.pasv().await;
     assert_eq!(c.cmd("RETR file.txt").await.0, 150);
@@ -191,7 +227,10 @@ async fn full_flow_pasv() {
 
     assert_eq!(c.cmd("SYST").await.1, "215 UNIX mini-ftpd");
     assert_eq!(c.cmd("NOOP").await.1, "200 OK");
-    assert_eq!(c.cmd("FEAT").await.0, 502);
+    let (code, feat) = c.cmd("FEAT").await;
+    assert_eq!(code, 211);
+    assert!(feat.contains("UTF8"), "{feat}");
+    assert_eq!(c.cmd("FOOBAR").await.0, 502);
     assert_eq!(c.cmd("PORT 1,2,3").await.0, 501);
 
     let (code, _) = c.cmd("QUIT").await;
@@ -361,4 +400,74 @@ async fn abor_cancels_upload() {
 
     // The session is still usable afterwards.
     assert_eq!(c.cmd("NOOP").await.1, "200 OK");
+}
+
+#[tokio::test]
+async fn chinese_filenames_gbk_by_default_and_utf8_after_opts() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("中文目录")).unwrap();
+    std::fs::write(tmp.path().join("中文目录/文件.txt"), b"content").unwrap();
+    let addr = start_server(tmp.path(), full_perms(), 10, 60).await;
+    let mut c = Client::connect(addr).await;
+    c.login().await;
+
+    let gbk = |s: &str| GBK.encode(s).0.into_owned();
+    let decode_gbk = |b: &[u8]| GBK.decode(b).0.into_owned();
+
+    // Default mode speaks GBK, like Windows Explorer / ftp.exe.
+    let mut cmd = b"CWD ".to_vec();
+    cmd.extend_from_slice(&gbk("中文目录"));
+    let (code, reply) = c.cmd_raw(&cmd).await;
+    assert_eq!(code, 250);
+    assert!(decode_gbk(&reply).contains("\"/中文目录\""), "{reply:?}");
+
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd("LIST").await.0, 150);
+    let listing = read_all(&mut data).await;
+    assert_eq!(c.read_reply().await.0, 226);
+    assert!(decode_gbk(&listing).contains("文件.txt"), "{listing:?}");
+
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd("NLST").await.0, 150);
+    let names = read_all(&mut data).await;
+    assert_eq!(c.read_reply().await.0, 226);
+    assert_eq!(decode_gbk(&names), "文件.txt\r\n");
+
+    let mut cmd = b"RETR ".to_vec();
+    cmd.extend_from_slice(&gbk("文件.txt"));
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd_raw(&cmd).await.0, 150);
+    let body = read_all(&mut data).await;
+    assert_eq!(c.read_reply().await.0, 226);
+    assert_eq!(body, b"content");
+
+    // MKD with a GBK name creates the real directory.
+    let mut cmd = b"MKD ".to_vec();
+    cmd.extend_from_slice(&gbk("新文件夹"));
+    assert_eq!(c.cmd_raw(&cmd).await.0, 250);
+    assert!(tmp.path().join("中文目录/新文件夹").is_dir());
+
+    // RFC 2640 clients switch to UTF-8.
+    assert_eq!(c.cmd("OPTS UTF8 ON").await.0, 200);
+    let (code, reply) = c.cmd_raw("CWD /中文目录".as_bytes()).await;
+    assert_eq!(code, 250);
+    assert!(String::from_utf8(reply).unwrap().contains("\"/中文目录\""));
+
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd("LIST").await.0, 150);
+    let listing = read_all(&mut data).await;
+    assert_eq!(c.read_reply().await.0, 226);
+    assert!(String::from_utf8(listing).unwrap().contains("文件.txt"));
+
+    let mut data = c.pasv().await;
+    assert_eq!(c.cmd("NLST").await.0, 150);
+    let names = read_all(&mut data).await;
+    assert_eq!(c.read_reply().await.0, 226);
+    assert!(String::from_utf8(names).unwrap().contains("文件.txt"));
+
+    // OPTS UTF8 OFF switches back to GBK.
+    assert_eq!(c.cmd("OPTS UTF8 OFF").await.0, 200);
+    let mut cmd = b"CWD ".to_vec();
+    cmd.extend_from_slice(&gbk("/中文目录"));
+    assert_eq!(c.cmd_raw(&cmd).await.0, 250);
 }

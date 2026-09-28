@@ -178,6 +178,18 @@ impl VirtualFs {
         }
         Ok(out)
     }
+
+    /// NLST variant: bare names only, one per line.
+    pub fn list_names(&self, dir: &Path) -> io::Result<String> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        let mut out = String::new();
+        for entry in entries {
+            out.push_str(&entry.file_name().to_string_lossy());
+            out.push_str("\r\n");
+        }
+        Ok(out)
+    }
 }
 
 pub fn format_entry(name: &str, meta: &std::fs::Metadata) -> String {
